@@ -172,7 +172,15 @@ install_img4() {
     clone_once 'https://github.com/xerub/img4lib.git' "$src"
     git -C "$src" submodule update --init --recursive
     if [[ -d "$src/lzfse" ]]; then
-        cmake -S "$src/lzfse" -B "$src/lzfse/build" -DCMAKE_BUILD_TYPE=Release
+        rm -rf "$src/lzfse/build"
+        mkdir -p "$src/lzfse/build/bin"
+        cmake -S "$src/lzfse" -B "$src/lzfse/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$src/lzfse/build/bin" \
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$src/lzfse/build/bin" \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$src/lzfse/build/bin"
         cmake --build "$src/lzfse/build" --parallel "$JOBS"
     fi
     make -C "$src" -j"$JOBS"
@@ -194,6 +202,10 @@ install_ibootim() {
     log 'Building ibootim for Linux'
     local src="$VENDOR/ibootim"
     clone_once 'https://github.com/realnp/ibootim.git' "$src"
+    # EFTYPE exists on BSD/macOS but not glibc/Linux. realnp/ibootim's
+    # Makefile hardcodes gcc and does not consume CFLAGS, so patch the vendored
+    # source locally before building. EINVAL is the portable error code here.
+    sed -i 's/\bEFTYPE\b/EINVAL/g' "$src/ibootim.c"
     make -C "$src" -j"$JOBS"
     install -m 755 "$src/ibootim" "$TOOLS/ibootim"
     ok 'ibootim'
@@ -327,7 +339,7 @@ write_linux_env() {
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export NEW_RAMDISK_ROOT="$ROOT"
 export NR_VERSION="v1.2-ICHA12A13-wsl2"
-export NR_AUTHOR="@Official_I_C_H + WSL2 host port"
+export NR_AUTHOR="Original: @Official_I_C_H · WSL2/Linux port: @SpaceDudem"
 export NR_TELEGRAM="https://t.me/Official_I_C_H"
 case "$(uname -s)" in
     Linux) export NR_TOOLS="$ROOT/tools/linux" ;;
@@ -356,7 +368,10 @@ EOF
 write_linux_ramdisk() {
     cat > "$ROOT/scripts/ramdisk_expand.sh" <<'EOF'
 #!/usr/bin/env bash
-# WSL/Linux APFS RestoreRamDisk clone + SSH injection.
+# WSL/Linux APFS RestoreRamDisk injection.
+#
+# Preserve Apple's stock APFS image. Recreating the filesystem expands roughly
+# 770 MiB of logical data and can exceed the boot ramdisk image size limit.
 
 nr_expand_inject_ramdisk() {
     local stock_dmg="$1"
@@ -367,7 +382,6 @@ nr_expand_inject_ramdisk() {
     [[ -s "$stock_dmg" ]] || { echo "ramdisk: missing $stock_dmg" >&2; return 1; }
     [[ -s "$ssh_tar" ]] || { echo "ramdisk: missing $ssh_tar" >&2; return 1; }
     command -v sudo >/dev/null || { echo 'ramdisk: sudo is required' >&2; return 1; }
-    [[ -x "$NR_TOOLS/mkapfs" ]] || { echo 'ramdisk: tools/linux/mkapfs missing' >&2; return 1; }
 
     sudo -v
     sudo modprobe libcrc32c 2>/dev/null || true
@@ -376,69 +390,86 @@ nr_expand_inject_ramdisk() {
         return 1
     }
 
-    local stock_bytes headroom max_bytes target_bytes
-    stock_bytes="$(stat -c%s "$stock_dmg")"
-    headroom=$((80 * 1024 * 1024))
-    max_bytes=$((280 * 1024 * 1024))
-    target_bytes=$((stock_bytes + headroom))
-    (( target_bytes < 256 * 1024 * 1024 )) && target_bytes=$((256 * 1024 * 1024))
-    (( target_bytes > max_bytes )) && target_bytes=$max_bytes
-    (( target_bytes <= stock_bytes )) && target_bytes=$stock_bytes
-
-    echo "ramdisk linux: stock=${stock_bytes} target=${target_bytes}"
-
-    local td stock_mp new_mp new_img mounted_stock=0 mounted_new=0
+    local td payload slim_tar mount_pt backup
+    local mounted=0
     td="$(mktemp -d /tmp/ich-rd.XXXXXX)"
-    stock_mp="$td/stock"
-    new_mp="$td/new"
-    new_img="$td/ramdisk.new.dmg"
-    mkdir -p "$stock_mp" "$new_mp"
+    payload="$td/payload"
+    slim_tar="$td/ssh-slim.tar"
+    mount_pt="$td/ramdisk"
+    backup="${stock_dmg}.pre-wsl-port.bak"
+    mkdir -p "$payload" "$mount_pt"
 
     _nr_linux_cleanup() {
         set +e
-        ((mounted_new)) && sudo umount "$new_mp" >/dev/null 2>&1
-        ((mounted_stock)) && sudo umount "$stock_mp" >/dev/null 2>&1
-        rm -rf "$td"
+        ((mounted)) && sudo umount "$mount_pt" >/dev/null 2>&1
+        sudo rm -rf "$td" >/dev/null 2>&1 || rm -rf "$td"
     }
     trap _nr_linux_cleanup RETURN
 
-    truncate -s "$target_bytes" "$new_img"
-    "$NR_TOOLS/mkapfs" -L RestoreRamDisk "$new_img"
+    cp -f "$stock_dmg" "$backup"
 
-    sudo mount -t apfs -o loop,ro "$stock_dmg" "$stock_mp"
-    mounted_stock=1
-    sudo mount -t apfs -o loop,rw,readwrite "$new_img" "$new_mp"
-    mounted_new=1
+    echo 'ramdisk linux: preparing slim SSH payload'
+    sudo "$gtar_bin" -x --numeric-owner -f "$ssh_tar" -C "$payload"
+    sudo rm -f "$payload/usr/share/misc/magic.mgc"
+    sudo rm -rf "$payload/usr/share/locale" "$payload/usr/share/nano"
 
-    echo 'ramdisk linux: cloning stock filesystem'
-    sudo cp -a "$stock_mp"/. "$new_mp"/
+    if [[ -d "$payload/usr/share/terminfo" ]]; then
+        sudo find "$payload/usr/share/terminfo" -mindepth 1 -maxdepth 1 \
+            ! -name x ! -name v ! -name s ! -name t -exec rm -rf {} +
+    fi
 
-    echo 'ramdisk linux: injecting SSH payload'
-    sudo "$gtar_bin" -x --no-overwrite-dir --same-owner --same-permissions -f "$ssh_tar" -C "$new_mp/"
+    sudo "$gtar_bin" -c --numeric-owner -f "$slim_tar" -C "$payload" .
+    local stock_bytes slim_bytes slim_unpacked
+    stock_bytes="$(stat -c%s "$stock_dmg")"
+    slim_bytes="$(sudo stat -c%s "$slim_tar")"
+    slim_unpacked="$(sudo du -sb "$payload" | awk '{print $1}')"
+    echo "ramdisk linux: stock=${stock_bytes} slim_archive=${slim_bytes} slim_payload=${slim_unpacked}"
 
-    if [[ -f "$new_mp/usr/bin/mount_ich" ]]; then
-        sudo chmod 755 "$new_mp/usr/bin/mount_ich"
+    echo 'ramdisk linux: mounting stock APFS read/write'
+    if ! sudo mount -t apfs -o loop,rw,readwrite "$stock_dmg" "$mount_pt"; then
+        cp -f "$backup" "$stock_dmg"
+        echo 'ramdisk: APFS mount failed; restored original image' >&2
+        return 1
+    fi
+    mounted=1
+
+    df -h "$mount_pt" | sed 's/^/  filesystem before: /' || true
+    echo 'ramdisk linux: injecting slim SSH payload directly into stock APFS'
+    if ! sudo "$gtar_bin" -x --numeric-owner --no-overwrite-dir --same-owner --same-permissions \
+        -f "$slim_tar" -C "$mount_pt/"; then
+        sudo umount "$mount_pt" >/dev/null 2>&1 || true
+        mounted=0
+        cp -f "$backup" "$stock_dmg"
+        echo 'ramdisk: SSH injection failed; restored original image' >&2
+        return 1
+    fi
+
+    if [[ -f "$mount_pt/usr/bin/mount_ich" ]]; then
+        sudo chmod 755 "$mount_pt/usr/bin/mount_ich"
     else
         echo 'warning: usr/bin/mount_ich missing after SSH payload injection' >&2
     fi
 
-    if [[ -f "$NR_RESOURCES/restored_external" && -d "$new_mp/usr/local/bin" ]]; then
-        sudo cp "$NR_RESOURCES/restored_external" "$new_mp/usr/local/bin/restored_external"
-        sudo chmod 755 "$new_mp/usr/local/bin/restored_external"
+    if [[ -f "$NR_RESOURCES/restored_external" && -d "$mount_pt/usr/local/bin" ]]; then
+        sudo cp "$NR_RESOURCES/restored_external" "$mount_pt/usr/local/bin/restored_external"
+        sudo chmod 755 "$mount_pt/usr/local/bin/restored_external"
         echo 'ramdisk linux: installed ICH restored_external'
     fi
 
     sync
-    sudo umount "$new_mp"
-    mounted_new=0
-    sudo umount "$stock_mp"
-    mounted_stock=0
+    df -h "$mount_pt" | sed 's/^/  filesystem after:  /' || true
+    local avail
+    avail="$(df -B1 --output=avail "$mount_pt" | tail -1 | tr -d ' ')"
+    if [[ -n "$avail" && "$avail" =~ ^[0-9]+$ && "$avail" -lt 1048576 ]]; then
+        echo "warning: only ${avail} bytes remain free in RestoreRamDisk" >&2
+    fi
 
-    cp -f "$stock_dmg" "${stock_dmg}.pre-wsl-port.bak"
-    mv -f "$new_img" "$stock_dmg"
-    rm -rf "$td"
+    sudo umount "$mount_pt"
+    mounted=0
+    rm -f "$backup"
+    sudo rm -rf "$td"
     trap - RETURN
-    echo 'ramdisk linux: APFS clone/inject OK'
+    echo "ramdisk linux: direct APFS injection OK (${stock_bytes} bytes)"
 }
 EOF
     chmod 755 "$ROOT/scripts/ramdisk_expand.sh"
@@ -479,6 +510,33 @@ build.write_text(s)
 
 s = boot.read_text()
 s = s.replace('[[ "$PWND" == "usbliter8" ]]', '[[ "${PWND,,}" == "usbliter8" ]]')
+
+# tools/linux/usbliter8ctl is a Bash wrapper around the Python implementation.
+# Invoke the wrapper directly rather than feeding the Bash wrapper to python3.
+s = s.replace('python3 "$USBLITER8CTL" boot "$image"', '"$USBLITER8CTL" boot "$image"')
+s = s.replace(
+    'python3 "$USBLITER8CTL" boot "$BOOTCHAIN/iBSS.patched.bin" || true',
+    '"$USBLITER8CTL" boot "$BOOTCHAIN/iBSS.patched.bin"'
+)
+
+# Propagate an early usbliter8ctl failure instead of reporting "Boot triggered".
+s = s.replace('local tmp logpid', 'local tmp logpid rc')
+old_wait = '''            wait "$logpid" || true
+            cat "$tmp"
+            rm -f "$tmp"
+            return 0'''
+new_wait = '''            if wait "$logpid"; then
+                cat "$tmp"
+                rm -f "$tmp"
+                return 0
+            else
+                rc=$?
+                cat "$tmp"
+                rm -f "$tmp"
+                echo "error: usbliter8ctl boot failed (exit $rc)" >&2
+                return "$rc"
+            fi'''
+s = s.replace(old_wait, new_wait)
 boot.write_text(s)
 PY
 
@@ -502,6 +560,18 @@ verify_tools() {
     ((fail == 0)) || die 'Toolchain verification failed'
 }
 
+install_apple_udev_rule() {
+    log 'Installing Apple USB udev permissions'
+    local rule='/etc/udev/rules.d/39-apple-usb.rules'
+    getent group plugdev >/dev/null 2>&1 || sudo groupadd --system plugdev
+    sudo usermod -aG plugdev "$USER"
+    printf '%s\n' 'SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", MODE="0666", GROUP="plugdev"' \
+        | sudo tee "$rule" >/dev/null
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=usb || true
+    ok "$rule"
+}
+
 install_all() {
     require_wsl
     apt_install
@@ -516,6 +586,7 @@ install_all() {
     install_apfsprogs
     install_usbliter8ctl
     install_pzb_wrapper
+    install_apple_udev_rule
     patch_build_and_boot
     verify_tools
 
@@ -601,32 +672,76 @@ build_apfs_module() {
 
     grep -qw apfs /proc/filesystems || die 'apfs module loaded but filesystem did not register'
     ok 'linux-apfs-rw loaded'
+    install_usbip_modules || true
     touch "$STATE/apfs-ready"
+}
+
+install_usbip_modules() {
+    require_wsl
+    local krel base ksrc
+    krel="$(uname -r)"
+    base="${krel%%-microsoft*}"
+    ksrc="$VENDOR/WSL2-Linux-Kernel-$base"
+
+    if modprobe -n vhci_hcd >/dev/null 2>&1; then
+        return 0
+    fi
+    [[ -d "$ksrc" ]] || return 0
+
+    local rel dst srcmod
+    log 'Installing USB/IP modules for the custom WSL kernel'
+    for rel in \
+        drivers/usb/common/usb-common.ko \
+        drivers/usb/core/usbcore.ko \
+        drivers/usb/usbip/usbip-core.ko \
+        drivers/usb/usbip/vhci-hcd.ko; do
+        srcmod="$ksrc/$rel"
+        [[ -s "$srcmod" ]] || {
+            warn "custom kernel module missing: $rel"
+            continue
+        }
+        dst="/lib/modules/$krel/kernel/$(dirname "$rel")"
+        sudo mkdir -p "$dst"
+        sudo install -m 644 "$srcmod" "$dst/$(basename "$rel")"
+    done
+
+    sudo depmod -a "$krel" || true
+    sudo modprobe usb_common 2>/dev/null || true
+    sudo modprobe usbcore 2>/dev/null || true
+    sudo modprobe usbip_core 2>/dev/null || true
+    if sudo modprobe vhci_hcd; then
+        ok 'vhci_hcd loaded'
+    else
+        warn 'vhci_hcd still unavailable; usbipd attach may fail'
+    fi
 }
 
 usb_attach() {
     require_wsl
+    install_usbip_modules
     command -v usbipd.exe >/dev/null 2>&1 || die 'usbipd.exe is not visible from WSL. Install usbipd-win on Windows first.'
 
-    log 'Locating Apple DFU device on Windows'
+    log 'Locating Apple DFU/Recovery device on Windows'
     local list busid
     list="$(usbipd.exe list 2>/dev/null | tr -d '\r')"
-    printf '%s\n' "$list" | grep -Ei '05ac:1227|Apple.*DFU' || true
-    busid="$(printf '%s\n' "$list" | awk 'tolower($0) ~ /05ac:1227|apple.*dfu/ {print $1; exit}')"
-    [[ -n "$busid" ]] || die 'No Apple 05ac:1227 DFU device is currently visible to usbipd.'
+    printf '%s\n' "$list" | grep -Ei '05ac:(1227|1281)|Apple.*(DFU|Recovery)' || true
+    busid="$(printf '%s\n' "$list" | awk 'tolower($0) ~ /05ac:(1227|1281)|apple.*(dfu|recovery)/ {print $1; exit}')"
+    [[ -n "$busid" ]] || die 'No Apple DFU/Recovery device is currently visible to usbipd.'
     ok "BUSID $busid"
 
-    log 'Attaching DFU device to WSL'
+    log 'Attaching Apple DFU/Recovery device to WSL'
     if ! usbipd.exe attach --wsl --auto-attach --busid "$busid"; then
-        printf '\nIf this BUSID has never been shared, run this ONCE in elevated Windows PowerShell:\n'
-        printf '  usbipd bind --busid %s\n' "$busid"
-        printf 'Then rerun: %s usb\n' "$0"
-        exit 2
+        if ! usbipd.exe attach --wsl --busid "$busid"; then
+            printf '\nIf this BUSID has never been shared, run this ONCE in elevated Windows PowerShell:\n'
+            printf '  usbipd bind --busid %s\n' "$busid"
+            printf 'Then rerun: %s usb\n' "$0"
+            exit 2
+        fi
     fi
 
     sleep 1
     if command -v lsusb >/dev/null 2>&1; then
-        lsusb | grep -i '05ac:1227' || warn 'attach returned success but 05ac:1227 is not yet visible in lsusb'
+        lsusb | grep -Ei '05ac:(1227|1281)' || warn 'attach returned success but no Apple DFU/Recovery device is visible in lsusb'
     fi
 }
 
