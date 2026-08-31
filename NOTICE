@@ -1,0 +1,49 @@
+ICH A12/A13 SSH Ramdisk — WSL2/Linux Port
+
+Original project:
+  ICHA12A13 / new_ramdisk v1.2
+  Author / contact: @Official_I_C_H
+  https://github.com/Pa7r0n/ICH_A12_plus_Ramdisk
+  https://t.me/Official_I_C_H
+
+WSL2/Linux port:
+  @SpaceDudem (spacedudem / erktheerk)
+  https://github.com/SpaceDudem/ICH_A12_plus_Ramdisk-WSL2
+
+This repository is derived from and interoperates with ICH_A12_plus_Ramdisk.
+The original project's authorship, MIT notice, third-party credits, and the
+licenses/copyrights of all external components remain in effect.
+
+The WSL2/Linux port adds host-side Linux/WSL integration work including native
+Linux toolchain handling, APFS support under WSL2, USB/IP integration,
+RestoreRamDisk injection changes, Linux-specific compatibility fixes, and
+WSL build/boot/status orchestration.
+
+This project packages and orchestrates third-party research tools. It does not
+claim authorship of the underlying exploits, patchfinders, firmware formats,
+or third-party utilities.
+
+Upstream credits retained from ICH_A12_plus_Ramdisk:
+
+- Paradigm Shift — usbliter8 BootROM exploit (RP2350)
+  https://github.com/prdgmshift/usbliter8
+- Leeksov — usbliter8ra1n and standalone patchfinders
+  (iBoot / SPTM / TXM / kernel)
+- Duy Tran — TXM policy field research
+- Matthew Pierson / vphone-cli — FirmwarePatcher / ramdisk build reference
+- palera1n / checkra1n — ramdisk / trustcache / SSHRD infrastructure
+- blacktop/ipsw — firmware extraction
+- SSHRD_Script (Nathan / verygenericname) — ssh.tar.gz RestoreRamDisk payload
+- TrollStore (opa334) — helper binaries included by the upstream SSH payload
+
+The upstream Darwin host binaries originate from the Spironolactone /
+palera1n-adjacent toolchain, including img4, trustcache, pzb, irecovery,
+usbliter8_boot, and libusb components.
+
+WSL2/Linux-specific external components additionally include projects such as
+Microsoft's WSL2 Linux kernel, usbipd-win, linux-apfs/linux-apfs-rw,
+apfsprogs, and native Linux builds of upstream host tools. See
+THIRD_PARTY_NOTICES.md and the license files accompanying each dependency.
+
+Research / educational use only. You are responsible for device ownership,
+authorization, backups, and compliance with applicable law.

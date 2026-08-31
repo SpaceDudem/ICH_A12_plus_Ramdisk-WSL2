@@ -1,0 +1,66 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local/vendor source and build trees
+.wsl-vendor/
+.local/
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Generated ICH data
+cache/
+work/
+bootchain/
+downloads/
+ipsw/
+*.ipsw
+*.dmg
+*.img4
+*.im4p
+*.im4m
+*.raw
+
+# Kernel builds / modules
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.symvers
+modules.order
+Module.symvers
+.vmlinux*
+vmlinux
+bzImage
+
+# Logs / state / temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.wsl-port-backup/
+.state/
+
+# Device/build-specific generated markers
+chain.info
+with-fw.enabled
+use-ibss
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
